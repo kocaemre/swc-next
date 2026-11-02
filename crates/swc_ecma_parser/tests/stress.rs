@@ -157,6 +157,12 @@ fn binding_pattern_lookahead() {
         let source = format!("type A = {};", nest("({[x as ", "]: A})", 40));
         parse(source, options);
 
+        let source = format!("{};", nest("([a = ", "]) => 0", 40));
+        parse(source, options);
+
+        let source = format!("{};", nest("({a = ", "}) => 0", 40));
+        parse(source, options);
+
         let source = format!("{};", nest("(a,", ")", 20_000));
         parse(source, options);
 

@@ -1310,13 +1310,16 @@ impl<C: ParserConfig> Drop for Peek<'_, '_, C> {
 }
 
 #[derive(Clone, Copy)]
-struct ComputedKeyLookahead {
+struct BindingExpressionLookahead {
     expression_span: Span,
-    close: Token,
+    next: Token,
+    lexer_cursor: u32,
+    lexer_state: LexerState,
+    lexer_mode: LexerMode,
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
-struct ComputedKeyContext {
+struct BindingExpressionContext {
     grammar: SpeculationKey,
     type_argument_depth: u32,
     source_type: u8,
@@ -1329,7 +1332,7 @@ struct BindingPatternLookahead {
     active: bool,
     /// Reuse only diagnostic-free expression parses in the same grammar and
     /// type-argument speculation depth. No AST handles survive rollback.
-    computed_keys: FxHashMap<ComputedKeyContext, ComputedKeyLookahead>,
+    expressions: FxHashMap<BindingExpressionContext, BindingExpressionLookahead>,
 }
 
 #[derive(Default)]
@@ -7164,7 +7167,6 @@ impl<'a, C: ParserConfig> Parser<'a, C> {
         self.look_ahead_binding_pattern(|parser| {
             let diagnostics_len = parser.diagnostics.len();
             parser.advance()?;
-            parser.context.insert(Context::IN);
             parser.ts_context.insert(TsContext::ALLOW_ARROW_RETURN_TYPE);
             if parser
                 .with_type_binding_context(Self::skip_binding_pattern)
@@ -7189,6 +7191,7 @@ impl<'a, C: ParserConfig> Parser<'a, C> {
         parse: impl FnOnce(&mut Self) -> Option<bool>,
     ) -> Option<bool> {
         let checkpoint = self.checkpoint();
+        self.context.insert(Context::IN);
         let active = mem::replace(&mut self.binding_pattern_lookahead.active, true);
         let result = parse(self);
         self.rewind(checkpoint);
@@ -9224,11 +9227,64 @@ impl<'a, C: ParserConfig> Parser<'a, C> {
     fn parse_value_expression(&mut self, minimum: Precedence) -> Option<Expr> {
         let ts_context = self.ts_context;
         self.ts_context.remove(TsContext::IN_TYPE_BINDING);
-        let expression = self.with_resolved_cover(|parser| {
-            parser.parse_expr(minimum, ParseExpressionOpts::default())
-        });
+        let expression =
+            if minimum == Precedence::Assignment && self.binding_pattern_lookahead.active {
+                self.parse_binding_expression_lookahead()
+            } else {
+                self.with_resolved_cover(|parser| {
+                    parser.parse_expr(minimum, ParseExpressionOpts::default())
+                })
+            };
         self.ts_context = ts_context;
         expression
+    }
+
+    fn parse_binding_expression_lookahead(&mut self) -> Option<Expr> {
+        debug_assert!(self.binding_pattern_lookahead.active);
+        let key = BindingExpressionContext {
+            grammar: self.speculation_key(),
+            type_argument_depth: self.type_argument_speculation_depth,
+            source_type: self.source_type as u8,
+            await_identifier: self.await_identifier_in_async_head,
+        };
+        if let Some(cached) = self
+            .binding_pattern_lookahead
+            .expressions
+            .get(&key)
+            .copied()
+        {
+            self.lexer.cursor = cached.lexer_cursor;
+            self.lexer.state = cached.lexer_state;
+            self.lexer.mode = cached.lexer_mode;
+            self.current_token = cached.next;
+            // Keys and initializer values are opaque in this disposable AST.
+            // Committed parsing always builds the original expression.
+            return Some(
+                self.ast
+                    .expr_identifier_reference(cached.expression_span, AstUtf8::EMPTY),
+            );
+        }
+        let diagnostics_len = self.diagnostics.len();
+        let module_detection = self.module_detection;
+        let expression = self.with_resolved_cover(|parser| {
+            parser.parse_expr(Precedence::Assignment, ParseExpressionOpts::default())
+        })?;
+        if self.diagnostics.len() == diagnostics_len
+            && self.module_detection == module_detection
+            && self.await_identifier_in_async_head == key.await_identifier
+        {
+            self.binding_pattern_lookahead.expressions.insert(
+                key,
+                BindingExpressionLookahead {
+                    expression_span: expression.span(&self.ast),
+                    next: self.current_token,
+                    lexer_cursor: self.lexer.cursor,
+                    lexer_state: self.lexer.state,
+                    lexer_mode: self.lexer.mode,
+                },
+            );
+        }
+        Some(expression)
     }
 
     // RelationalExpression[In, Yield, Await] :
@@ -11910,32 +11966,6 @@ impl<'a, C: ParserConfig> Parser<'a, C> {
         self.ts_context.insert(TsContext::ALLOW_ARROW_RETURN_TYPE);
         self.ts_context.remove(TsContext::IN_TYPE_BINDING);
         let result = (|| {
-            let key = ComputedKeyContext {
-                grammar: self.speculation_key(),
-                type_argument_depth: self.type_argument_speculation_depth,
-                source_type: self.source_type as u8,
-                await_identifier: self.await_identifier_in_async_head,
-            };
-            let lookahead = self.binding_pattern_lookahead.active;
-            if lookahead
-                && let Some(cached) = self
-                    .binding_pattern_lookahead
-                    .computed_keys
-                    .get(&key)
-                    .copied()
-            {
-                self.lexer.rewind_to(cached.close.end());
-                self.current_token = cached.close;
-                self.advance()?;
-                // Only binding structure is inspected in this disposable AST.
-                // Committed parsing always builds the original key expression.
-                return Some(
-                    self.ast
-                        .expr_identifier_reference(cached.expression_span, AstUtf8::EMPTY),
-                );
-            }
-            let diagnostics_len = self.diagnostics.len();
-            let module_detection = self.module_detection;
             self.advance()?;
             let expression = self.parse_value_expression(Precedence::Assignment)?;
             let expression = if self.current_token.tag() == TokenTag::Comma {
@@ -11948,7 +11978,6 @@ impl<'a, C: ParserConfig> Parser<'a, C> {
             } else {
                 expression
             };
-            let close = self.current_token;
             let (message, help) = if in_cover {
                 ("Expected ']' after computed property key", None)
             } else {
@@ -11959,20 +11988,6 @@ impl<'a, C: ParserConfig> Parser<'a, C> {
             };
             if !self.expect(TokenTag::RightBracket, message, help) {
                 return None;
-            }
-            if lookahead
-                && self.diagnostics.len() == diagnostics_len
-                && self.module_detection == module_detection
-                && self.await_identifier_in_async_head == key.await_identifier
-            {
-                let expression_span = expression.span(&self.ast);
-                self.binding_pattern_lookahead.computed_keys.insert(
-                    key,
-                    ComputedKeyLookahead {
-                        expression_span,
-                        close,
-                    },
-                );
             }
             Some(expression)
         })();
@@ -19361,6 +19376,14 @@ mod tests {
             lang: Lang::Tsx,
             ..ts
         };
+
+        for options in [ts, tsx] {
+            let errors = has_errors("for (([a = \"p\" in obj]: any) => 0;;) {}", options);
+            assert!(!errors);
+
+            let errors = has_errors("for (({a = \"p\" in obj}: any) => 0;;) {}", options);
+            assert!(!errors);
+        }
 
         let types = parse_boundary("items.map((item): Item => item)", ts);
         assert_eq!(types, ["Item"]);
