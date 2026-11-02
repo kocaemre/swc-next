@@ -1851,7 +1851,7 @@ const FAST_CLASS: [FastClass; 256] = {
     table
 };
 
-const IDENTIFIER_BATCH_SIZE: usize = 32;
+const IDENTIFIER_WORD_SIZE: usize = 8;
 
 /// How a byte after an ASCII identifier prefix affects the identifier.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1906,20 +1906,17 @@ fn scan_ascii_identifier_continue(source: &[u8], start: u32) -> Option<u32> {
     // `scan_ascii_identifier` passes the byte after a start byte it already read from `source`.
     let mut position = start as usize;
 
-    // Comparing the batch end instead of the remaining length keeps no extra counter live, so
-    // the scan fits in caller-saved registers. `position + IDENTIFIER_BATCH_SIZE` cannot overflow
-    // because a slice length is at most `isize::MAX`.
-    while position + IDENTIFIER_BATCH_SIZE <= source.len() {
-        let batch_end = position + IDENTIFIER_BATCH_SIZE;
-        // SAFETY: `position <= source.len()` by the caller invariant above, and the loop condition
-        // guarantees that `batch_end` is within `source`.
-        let batch = unsafe { source.get_unchecked(position..batch_end) };
-        for (offset, byte) in batch.iter().enumerate() {
-            if ASCII_IDENTIFIER_CLASS[*byte as usize] != IdentifierClass::Continue {
-                return ascii_identifier_end(*byte, position + offset);
-            }
+    // Test eight bytes at a time. The end of the identifier is found from the stop mask
+    // without a branch per byte, so identifiers of different lengths take the same path.
+    while let Some(word) = source.get(position..position + IDENTIFIER_WORD_SIZE) {
+        let word = u64::from_le_bytes(word.try_into().unwrap());
+        let stops = identifier_stop_mask(word);
+        if stops != 0 {
+            // The lowest high bit marks the first stop byte.
+            let shift = stops.trailing_zeros() & !7;
+            return ascii_identifier_end((word >> shift) as u8, position + (shift / 8) as usize);
         }
-        position += IDENTIFIER_BATCH_SIZE;
+        position += IDENTIFIER_WORD_SIZE;
     }
     while let Some(byte) = source.get(position) {
         if ASCII_IDENTIFIER_CLASS[*byte as usize] != IdentifierClass::Continue {
@@ -1931,6 +1928,29 @@ fn scan_ascii_identifier_continue(source: &[u8], start: u32) -> Option<u32> {
     debug_assert!(position >= start as usize);
     debug_assert!(position <= source.len());
     Some(position as u32)
+}
+
+/// Returns a mask with the high bit set in each byte of `word` that is not an
+/// ASCII identifier part, with bytes in little-endian order.
+#[inline(always)]
+fn identifier_stop_mask(word: u64) -> u64 {
+    const ONES: u64 = u64::from_le_bytes([1; 8]);
+    const HIGH: u64 = ONES * 0x80;
+    /// Sets the high bit of each byte in `lo..=hi`. Every byte of `bytes` is below
+    /// 0x80, so the additions cannot carry into the next byte.
+    #[inline(always)]
+    fn in_range(bytes: u64, lo: u8, hi: u8) -> u64 {
+        (bytes + ONES * u64::from(0x80 - lo)) & !(bytes + ONES * u64::from(0x7F - hi))
+    }
+
+    let ascii = word & !HIGH;
+    // Setting bit 0x20 maps uppercase letters to lowercase and keeps digits unchanged.
+    let letter = in_range(ascii | (ONES * 0x20), b'a', b'z');
+    let digit = in_range(ascii, b'0', b'9');
+    let underscore = in_range(ascii, b'_', b'_');
+    let dollar = in_range(ascii, b'$', b'$');
+    // Non-ASCII bytes keep their high bit and also stop the scan.
+    (!(letter | digit | underscore | dollar) | word) & HIGH
 }
 
 /// Ends an ASCII identifier part at `position`, where `byte` is not an
@@ -2295,6 +2315,19 @@ mod tests {
         let token = next_after_trivia(" \t--> comment\nname", true);
         assert_eq!(token.span(), Span::new(14, 18));
         assert!(token.has_line_terminator_before());
+    }
+
+    #[test]
+    fn identifier_scan() {
+        for byte in 0..=u8::MAX {
+            let stops = ASCII_IDENTIFIER_CLASS[byte as usize] != IdentifierClass::Continue;
+            for lane in 0..IDENTIFIER_WORD_SIZE {
+                let mut word = [b'a'; IDENTIFIER_WORD_SIZE];
+                word[lane] = byte;
+                let expected = if stops { 0x80 << (lane * 8) } else { 0 };
+                assert_eq!(identifier_stop_mask(u64::from_le_bytes(word)), expected);
+            }
+        }
     }
 
     #[test]
