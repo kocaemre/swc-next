@@ -1203,6 +1203,7 @@ pub struct Parser<'a, C: ParserConfig = NoTokenParserConfig> {
     failed_type_arguments: FxHashMap<SpeculationKey, TypeArgumentFailures>,
     type_argument_speculation_depth: u32,
     type_argument_lookahead: TypeArgumentLookahead,
+    binding_pattern_lookahead: BindingPatternLookahead,
 }
 
 pub struct ParseReturn<'a> {
@@ -1306,6 +1307,29 @@ impl<C: ParserConfig> Drop for Peek<'_, '_, C> {
             self.restore();
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct ComputedKeyLookahead {
+    expression_span: Span,
+    close: Token,
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct ComputedKeyContext {
+    grammar: SpeculationKey,
+    type_argument_depth: u32,
+    source_type: u8,
+    await_identifier: Option<Span>,
+}
+
+#[derive(Default)]
+struct BindingPatternLookahead {
+    /// ASTs built while active belong to a checkpoint that always rolls back.
+    active: bool,
+    /// Reuse only diagnostic-free expression parses in the same grammar and
+    /// type-argument speculation depth. No AST handles survive rollback.
+    computed_keys: FxHashMap<ComputedKeyContext, ComputedKeyLookahead>,
 }
 
 #[derive(Default)]
@@ -1501,6 +1525,7 @@ impl<'a, C: ParserConfig> Parser<'a, C> {
             failed_type_arguments: FxHashMap::default(),
             type_argument_speculation_depth: 0,
             type_argument_lookahead: TypeArgumentLookahead::default(),
+            binding_pattern_lookahead: BindingPatternLookahead::default(),
         }
     }
 
@@ -4150,6 +4175,15 @@ impl<'a, C: ParserConfig> Parser<'a, C> {
         kind: FormalParameterKind,
         allow_parameter_properties: bool,
     ) -> Option<(Option<TsThisParameter>, FormalParameters)> {
+        self.parse_formal_parameters_with_speculation(kind, allow_parameter_properties, false)
+    }
+
+    fn parse_formal_parameters_with_speculation(
+        &mut self,
+        kind: FormalParameterKind,
+        allow_parameter_properties: bool,
+        speculative: bool,
+    ) -> Option<(Option<TsThisParameter>, FormalParameters)> {
         let start = self.current_token.start();
         if !self.expect(
             TokenTag::LeftParen,
@@ -4196,6 +4230,21 @@ impl<'a, C: ParserConfig> Parser<'a, C> {
                     } else {
                         SubRange::empty()
                     };
+
+                if speculative
+                    && matches!(
+                        self.current_token.tag(),
+                        TokenTag::LeftParen
+                            | TokenTag::LeftBracket
+                            | TokenTag::LeftBrace
+                            | TokenTag::Spread
+                    )
+                {
+                    self.look_ahead_binding_pattern(|parser| {
+                        parser.eat(TokenTag::Spread)?;
+                        parser.skip_binding_pattern().map(|_| true)
+                    })?;
+                }
 
                 if self.current_token.tag() == TokenTag::Spread {
                     let parameter = self.parse_formal_parameter_rest(kind, decorators)?;
@@ -7112,27 +7161,89 @@ impl<'a, C: ParserConfig> Parser<'a, C> {
     }
 
     fn is_function_type_after_pattern(&mut self) -> Option<bool> {
-        let checkpoint = self.checkpoint();
-        let result = (|| {
-            self.advance()?;
-            if self
-                .with_type_binding_context(Self::parse_binding_pattern)
+        self.look_ahead_binding_pattern(|parser| {
+            let diagnostics_len = parser.diagnostics.len();
+            parser.advance()?;
+            parser.context.insert(Context::IN);
+            parser.ts_context.insert(TsContext::ALLOW_ARROW_RETURN_TYPE);
+            if parser
+                .with_type_binding_context(Self::skip_binding_pattern)
                 .is_none()
-                || !self.speculation_is_clean(&checkpoint)
+                || !parser.diagnostics.is_clean_since(diagnostics_len)
             {
                 return Some(false);
             }
-            Some(match self.current_token.tag() {
+            Some(match parser.current_token.tag() {
                 TokenTag::Colon | TokenTag::Comma | TokenTag::Question | TokenTag::Assign => true,
                 TokenTag::RightParen => {
-                    self.advance()?;
-                    self.current_token.tag() == TokenTag::Arrow
+                    parser.advance()?;
+                    parser.current_token.tag() == TokenTag::Arrow
                 }
                 _ => false,
             })
-        })();
+        })
+    }
+
+    fn look_ahead_binding_pattern(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Option<bool>,
+    ) -> Option<bool> {
+        let checkpoint = self.checkpoint();
+        let active = mem::replace(&mut self.binding_pattern_lookahead.active, true);
+        let result = parse(self);
         self.rewind(checkpoint);
+        self.binding_pattern_lookahead.active = active;
         result
+    }
+
+    /// Stop at the first token that cannot continue a binding pattern. Parsing
+    /// an expression cover here would recursively parse nested types before
+    /// rejecting them, then parse those types again after rewinding.
+    fn skip_binding_pattern(&mut self) -> Option<()> {
+        let close = match self.current_token.tag() {
+            TokenTag::LeftBracket => TokenTag::RightBracket,
+            TokenTag::LeftBrace => TokenTag::RightBrace,
+            tag if tag.is_identifier_like() => {
+                self.consume_identifier(IdentifierRole::Binding)?;
+                return Some(());
+            }
+            _ => return None,
+        };
+        self.advance()?;
+        while self.current_token.tag() != close {
+            if close == TokenTag::RightBracket && self.eat(TokenTag::Comma)? {
+                continue;
+            }
+            let rest = self.eat(TokenTag::Spread)?;
+            if close == TokenTag::RightBrace {
+                if rest {
+                    self.consume_identifier(IdentifierRole::Binding)?;
+                } else {
+                    let key = self.current_token;
+                    self.parse_property_key(true)?;
+                    if self.eat(TokenTag::Colon)? {
+                        self.skip_binding_pattern()?;
+                    } else if key.tag().is_identifier_like() {
+                        self.validate_identifier(key, IdentifierRole::Binding);
+                    } else {
+                        return None;
+                    }
+                }
+            } else {
+                self.skip_binding_pattern()?;
+            }
+            if rest {
+                if self.current_token.tag() != close {
+                    return None;
+                }
+            } else if self.eat(TokenTag::Assign)? {
+                self.parse_value_expression(Precedence::Assignment)?;
+            }
+            if self.current_token.tag() != close && !self.eat(TokenTag::Comma)? {
+                return None;
+            }
+        }
+        self.advance()
     }
 
     fn parse_function_or_constructor_type(&mut self) -> Option<TsType> {
@@ -10395,8 +10506,11 @@ impl<'a, C: ParserConfig> Parser<'a, C> {
         if self.current_token.tag() != TokenTag::LeftParen {
             return None;
         }
-        let (_, params) =
-            self.parse_formal_parameters(FormalParameterKind::ArrowFormalParameters, false)?;
+        let (_, params) = self.parse_formal_parameters_with_speculation(
+            FormalParameterKind::ArrowFormalParameters,
+            false,
+            !need_diagnostics,
+        )?;
 
         let return_type =
             if self.lang.is_typescript() && self.current_token.tag() == TokenTag::Colon {
@@ -11744,43 +11858,9 @@ impl<'a, C: ParserConfig> Parser<'a, C> {
                 );
                 Some(PropertyKey::Expr(Expr::PrivateIdentifier(private)))
             }
-            TokenTag::LeftBracket => {
-                self.advance()?;
-                // Computed keys stay expressions when an object cover becomes a
-                // binding pattern, so they must not replace binding evidence.
-                let context = enter_grammar_context![&mut self.context, +In];
-                let ts_context = self.ts_context;
-                self.ts_context.insert(TsContext::ALLOW_ARROW_RETURN_TYPE);
-                self.ts_context.remove(TsContext::IN_TYPE_BINDING);
-                let expression = (|| {
-                    let expression = self.parse_value_expression(Precedence::Assignment)?;
-                    if self.current_token.tag() == TokenTag::Comma {
-                        self.report(
-                            self.current_token.span(),
-                            "A comma expression in a computed property key must be parenthesized",
-                            ReportOptions::default(),
-                        );
-                        self.parse_sequence_expression(Precedence::Comma, expression)
-                    } else {
-                        Some(expression)
-                    }
-                })();
-                self.ts_context = ts_context;
-                self.context = context;
-                let expression = expression?;
-                let (message, help) = if in_cover {
-                    ("Expected ']' after computed property key", None)
-                } else {
-                    (
-                        "Expected ']' to close a computed property key",
-                        Some("A computed property key is written '[expr]'"),
-                    )
-                };
-                if !self.expect(TokenTag::RightBracket, message, help) {
-                    return None;
-                }
-                Some(PropertyKey::Expr(expression))
-            }
+            TokenTag::LeftBracket => self
+                .parse_computed_property_key(in_cover)
+                .map(PropertyKey::Expr),
             TokenTag::StringLiteral => Some(PropertyKey::Expr(Expr::StringLiteral(
                 self.parse_string_literal()?,
             ))),
@@ -11821,6 +11901,84 @@ impl<'a, C: ParserConfig> Parser<'a, C> {
                 None
             }
         }
+    }
+
+    fn parse_computed_property_key(&mut self, in_cover: bool) -> Option<Expr> {
+        // Computed names remain value expressions even in type-only bindings.
+        let context = enter_grammar_context![&mut self.context, +In];
+        let ts_context = self.ts_context;
+        self.ts_context.insert(TsContext::ALLOW_ARROW_RETURN_TYPE);
+        self.ts_context.remove(TsContext::IN_TYPE_BINDING);
+        let result = (|| {
+            let key = ComputedKeyContext {
+                grammar: self.speculation_key(),
+                type_argument_depth: self.type_argument_speculation_depth,
+                source_type: self.source_type as u8,
+                await_identifier: self.await_identifier_in_async_head,
+            };
+            let lookahead = self.binding_pattern_lookahead.active;
+            if lookahead
+                && let Some(cached) = self
+                    .binding_pattern_lookahead
+                    .computed_keys
+                    .get(&key)
+                    .copied()
+            {
+                self.lexer.rewind_to(cached.close.end());
+                self.current_token = cached.close;
+                self.advance()?;
+                // Only binding structure is inspected in this disposable AST.
+                // Committed parsing always builds the original key expression.
+                return Some(
+                    self.ast
+                        .expr_identifier_reference(cached.expression_span, AstUtf8::EMPTY),
+                );
+            }
+            let diagnostics_len = self.diagnostics.len();
+            let module_detection = self.module_detection;
+            self.advance()?;
+            let expression = self.parse_value_expression(Precedence::Assignment)?;
+            let expression = if self.current_token.tag() == TokenTag::Comma {
+                self.report(
+                    self.current_token.span(),
+                    "A comma expression in a computed property key must be parenthesized",
+                    ReportOptions::default(),
+                );
+                self.parse_sequence_expression(Precedence::Comma, expression)?
+            } else {
+                expression
+            };
+            let close = self.current_token;
+            let (message, help) = if in_cover {
+                ("Expected ']' after computed property key", None)
+            } else {
+                (
+                    "Expected ']' to close a computed property key",
+                    Some("A computed property key is written '[expr]'"),
+                )
+            };
+            if !self.expect(TokenTag::RightBracket, message, help) {
+                return None;
+            }
+            if lookahead
+                && self.diagnostics.len() == diagnostics_len
+                && self.module_detection == module_detection
+                && self.await_identifier_in_async_head == key.await_identifier
+            {
+                let expression_span = expression.span(&self.ast);
+                self.binding_pattern_lookahead.computed_keys.insert(
+                    key,
+                    ComputedKeyLookahead {
+                        expression_span,
+                        close,
+                    },
+                );
+            }
+            Some(expression)
+        })();
+        self.ts_context = ts_context;
+        self.context = context;
+        result
     }
 
     // MemberExpression[Yield, Await] :
@@ -14693,6 +14851,15 @@ mod tests {
         assert!(parsed.diagnostics.entries.is_empty());
         assert!(parsed.advance().is_none());
         assert!(!parsed.diagnostics.entries.is_empty());
+
+        let source = "type F = ({[x as ({[/* key */ y as U]: A})]: a}) => void;";
+        let parsed = parse_tokens(&allocator, source);
+        assert!(parsed.diagnostics.is_empty());
+        assert_eq!(
+            token_texts(source, &parsed.tokens).join(" "),
+            "type F = ( { [ x as ( { [ y as U ] : A } ) ] : a } ) => void ;"
+        );
+        assert_eq!(parsed.ast.comments().len(), 1);
     }
 
     #[test]
